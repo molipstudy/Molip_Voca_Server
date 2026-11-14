@@ -37,70 +37,22 @@ export const registerApiRoutes = (app, deps) => {
   })
 
   app.get('/api/auth/me', authRequired, async (req, res) => {
-    const { data, error } = await req.supabase
-      .schema('public')
-      .from('profiles')
-      .select('*')
-      .eq('id', req.user.id)
-      .maybeSingle()
-
-    if (error) {
-      sendError(res, error)
-      return
-    }
-
-    if (!data) {
-      const fallbackProfile = {
-        id: req.user.id,
-        email: req.user.email || '',
-        username: req.user.user_metadata?.username || (req.user.email || '').split('@')[0] || 'user',
-      }
-      const { data: upserted, error: upsertError } = await req.supabase
-        .schema('public')
-        .from('profiles')
-        .upsert(fallbackProfile)
-        .select('*')
-        .single()
-
-      if (upsertError) {
-        sendError(res, upsertError)
-        return
-      }
-
-      res.json(upserted)
-      return
-    }
-
+    const { data, error } = await req.supabase.rpc('account_profile')
+    if (error) { sendError(res, error); return }
+    if (!data) { res.status(404).json({ message: 'Profile not found' }); return }
     res.json(data)
   })
 
   app.patch('/api/auth/me', authRequired, async (req, res) => {
     const username = String(req.body?.username || '').trim()
-    const profileImageRaw = req.body?.profile_image
-
-    if (!username) {
-      res.status(400).json({ message: 'username is required' })
-      return
+    const profileImage = req.body?.profile_image ? String(req.body.profile_image).trim() : null
+    if (!username || username.length > 80 || (profileImage?.length || 0) > 2048) {
+      res.status(400).json({ message: 'Invalid profile' }); return
     }
-
-    const patch = {
-      id: req.user.id,
-      email: req.user.email || '',
-      username,
-      profile_image: profileImageRaw ? String(profileImageRaw).trim() : null,
-    }
-
-    const { data, error } = await req.supabase
-      .schema('public')
-      .from('profiles')
-      .upsert(patch, { onConflict: 'id' })
-      .select('*')
-      .single()
-
-    if (error) {
-      sendError(res, error)
-      return
-    }
+    const { data, error } = await req.supabase.rpc('update_account_profile', {
+      p_username: username, p_profile_image: profileImage,
+    })
+    if (error) { sendError(res, error); return }
     res.json(data)
   })
 
@@ -206,14 +158,12 @@ export const registerApiRoutes = (app, deps) => {
 
     if (ownerIds.length > 0) {
       const { data: profiles, error: profilesError } = await adminSupabase
-        .schema('public')
-        .from('profiles')
-        .select('id, username, email')
-        .in('id', ownerIds)
+        .schema('molip_voca')
+        .rpc('public_profiles', { p_ids: ownerIds })
 
       if (!profilesError && profiles) {
         ownerMap = new Map(
-          profiles.map((profile) => [profile.id, { username: profile.username, email: profile.email }])
+          profiles.map((profile) => [profile.id, { username: profile.username }])
         )
       }
     }
@@ -355,14 +305,11 @@ export const registerApiRoutes = (app, deps) => {
     let owner = null
     if (data.owner_id) {
       const { data: ownerProfile, error: ownerError } = await adminSupabase
-        .schema('public')
-        .from('profiles')
-        .select('id, username, email')
-        .eq('id', data.owner_id)
-        .maybeSingle()
+        .schema('molip_voca')
+        .rpc('public_profiles', { p_ids: [data.owner_id] })
 
       if (!ownerError && ownerProfile) {
-        owner = { username: ownerProfile.username, email: ownerProfile.email }
+        owner = ownerProfile[0] ? { username: ownerProfile[0].username } : null
       }
     }
 
@@ -656,10 +603,7 @@ export const registerApiRoutes = (app, deps) => {
 
   app.get('/api/vocas/:id/collaborators', authRequired, async (req, res) => {
     const { data, error } = await req.supabase
-      .from('voca_collaborators')
-      .select('id, user_id, voca_id, role, created_at, user:profiles!user_id(username, email)')
-      .eq('voca_id', req.params.id)
-      .order('created_at', { ascending: true })
+      .rpc('collaborator_profiles', { p_voca_id: req.params.id })
 
     if (error) {
       sendError(res, error)
@@ -677,22 +621,18 @@ export const registerApiRoutes = (app, deps) => {
       return
     }
 
-    const { data: profile, error: profileError } = await req.supabase
-      .schema('public')
-      .from('profiles')
-      .select('id')
-      .eq('email', normalizedEmail)
-      .maybeSingle()
+    const { data: profileId, error: profileError } = await req.supabase
+      .rpc('find_collaborator', { p_voca_id: req.params.id, p_email: normalizedEmail })
 
     if (profileError) {
       sendError(res, profileError)
       return
     }
-    if (!profile) {
+    if (!profileId) {
       res.status(404).json({ message: '해당 이메일 사용자를 찾을 수 없습니다.' })
       return
     }
-    if (profile.id === req.user.id) {
+    if (profileId === req.user.id) {
       res.status(400).json({ message: '본인은 초대할 수 없습니다.' })
       return
     }
@@ -700,7 +640,7 @@ export const registerApiRoutes = (app, deps) => {
     const { error } = await req.supabase
       .from('voca_collaborators')
       .upsert(
-        { user_id: profile.id, voca_id: req.params.id, role },
+        { user_id: profileId, voca_id: req.params.id, role },
         { onConflict: 'user_id,voca_id' }
       )
 
